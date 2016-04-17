@@ -1,0 +1,213 @@
+---
+title: "Logins Data Modeling"
+author: "Sathya Anand"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+require(forecast)
+require(TSA)
+require(ggplot2)
+require(ggfortify)
+```
+
+#### Load data files from model exploration notebook
+
+```{r dependent, echo=FALSE}
+# seasonality
+sp = 672
+
+# read in dependent variable
+df1 = read.csv(file.path('..', 'Data', 'y.csv'))
+y = df1[['LoginsTransformed']]
+
+# read in truncated dependent variable
+df2 = read.csv(file.path('..', 'Data', 'y_trunc.csv'))
+ytrunc = ts(df2[['LoginsTransformed']])
+```
+
+Length of input time series
+```{r temp1, echo=FALSE}
+length(y)
+```
+
+Length after truncating one season
+```{r temp2, echo=FALSE}
+length(ytrunc)
+```
+
+Exogenous variables matrix dimensions and sample of rows
+```{r exog, echo=FALSE}
+# read in exog
+exog = read.csv(file.path('..', 'Data', 'exog.csv'), row.names = 1)
+dim(exog)
+head(exog)
+```
+
+#### Let's figure out the best ARIMA model
+
+Using seasonal components in ARIMA with large period lengths causes memory issues. Here, we stick to non-seasonal ARIMA with seasonal lags thrown in as covariates. This is not entirely rigorous but should work well in practical settings. 
+```{r auto_arima, echo=TRUE}
+model = auto.arima(ytrunc, d=1,
+                   max.p=10, max.q=10, max.d=2,
+                   xreg=exog,
+                   stationary=TRUE,
+                   approximation=FALSE,
+                   allowmean=FALSE)
+summary(model)
+```
+
+#### Model diagnostics
+
+Residuals, ACF, and Ljung-Box plots
+```{r resid_diag, echo=TRUE}
+ggtsdiag(model, gof.lag=25)
+```
+
+Residuals QQ plot
+```{r resid_qq, echo=FALSE, message=FALSE}
+gg_qqplot = function(arima_model)
+{
+  res = data.frame("residuals"=arima_model$residuals)
+  y = quantile(res$residuals, c(0.25, 0.75))
+  x = qnorm(c(0.25, 0.75))
+  slope = diff(y)/diff(x)
+  int = y[1L] - slope * x[1L]
+  p = ggplot(res, aes(sample=residuals)) +
+      stat_qq(alpha = 0.5) +
+      geom_abline(slope = slope, intercept = int, color="red") +
+      xlab("Theoretical") +
+      ylab("Sample") + 
+      ggtitle("QQ Plot")
+  return(p)
+}
+gg_qqplot(model)
+```
+
+Looking at the above set of plots, the model seems to check out. Residuals are homoscedastic, have little autocorrelation and are normally distributed.
+
+#### Model Predictions
+
+Dimensions and sample of future covariates
+```{r new_exog, echo=FALSE}
+new_exog = read.csv(file.path('..', 'Data', 'new_exog.csv'), row.names = 1)
+dim(new_exog)
+head(new_exog)
+```
+
+Run predictions
+```{r predict, echo=TRUE}
+predictions = forecast(model, xreg=new_exog)
+print(predictions)
+```
+
+Plot predictions in transformed space
+(Only last full season shown here for clarity)
+```{r predict_plot, fig.width=10, fig.height=5, echo=FALSE, message=FALSE}
+fits = data.frame('period'=as.numeric(time(predictions$x)),
+                  'actual'=as.numeric(predictions$x),
+                  'value'=as.numeric(predictions$fitted),
+                  'lower95'=NA,
+                  'upper95'=NA,
+                  'type'='Fitted')
+
+preds = data.frame('period'=as.numeric(time(predictions$mean)),
+                   'actual'=NA,
+                   'value'=as.numeric(predictions$mean),
+                   'lower95'=predictions$lower[,2],
+                   'upper95'=predictions$upper[,2],
+                   'type'='Predicted')
+
+fits_and_preds = rbind(fits, preds)
+plot_df = tail(fits_and_preds, sp + dim(preds)[1])
+p = ggplot() + 
+  geom_point(data=plot_df, aes(x=period, y=actual), color='green') +
+  geom_point(data=plot_df, aes(x=period, y=value, color=type)) +
+  geom_ribbon(data=plot_df, aes(x=period, ymin=lower95,ymax=upper95), fill="gray", alpha="0.50") +
+  ylab('Logins') + xlab('Interval') +
+  ylim(0, 10)
+print(p)
+```
+
+Reverse transformation and plot in original space
+(Only last full season shown here for clarity)
+```{r predict_plot_org, fig.width=10, fig.height=5, echo=FALSE, message=FALSE}
+fits_org = data.frame('period'=as.numeric(time(predictions$x)),
+                  'actual'=as.numeric(predictions$x)^2 - 3/8,
+                  'value'=as.numeric(predictions$fitted)^2 - 3/8,
+                  'lower95'=NA,
+                  'upper95'=NA,
+                  'type'='Fitted')
+
+preds_org = data.frame('period'=as.numeric(time(predictions$mean)),
+                   'actual'=NA,
+                   'value'=as.numeric(predictions$mean)^2 - 3/8,
+                   'lower95'=predictions$lower[,2]^2 - 3/8,
+                   'upper95'=predictions$upper[,2]^2 - 3/8,
+                   'type'='Predicted')
+
+fits_and_preds_org = rbind(fits_org, preds_org)
+plot_df = tail(fits_and_preds_org, sp + dim(preds_org)[1])
+p = ggplot() + 
+  geom_point(data=plot_df, aes(x=period, y=actual), color='green') +
+  geom_point(data=plot_df, aes(x=period, y=value, color=type)) +
+  geom_ribbon(data=plot_df, aes(x=period, ymin=lower95,ymax=upper95), fill="gray", alpha="0.50") +
+  ylab('Logins') + xlab('Interval')
+print(p)
+```
+
+#### Estimating predictive accuracy of model
+
+While the RMSE from the model gives an indication of in-sample residual standard deviations, a truly predictive RMSE can be found by doing rolling estimation and forecasts over the window of interest. 
+
+In this case, we are interested in forecasting 4 periods ahead. If we have, as an example, 100 observed periods, we can train the model on 96 periods and calculate a prediction error on the last 4 periods. We can roll the training window back recursively to get better estimates on the error. 
+
+Note: this may take a while to generate.
+```{r roll_back, echo=FALSE}
+# get p, d, q for arima model
+model_order = arimaorder(model)
+
+# where to start rolling windows from
+n_ahead = 4
+roll_start = length(ytrunc) - sp - 1
+roll_end = length(ytrunc) - n_ahead
+
+n_ahead_rmse = data.frame('period'=rep(0, roll_end - roll_start),
+                          'rmse'=rep(0, roll_end - roll_start))
+counter = 1
+# pb = txtProgressBar(1, roll_end - roll_start, style=3)
+for (train_end_period in roll_start:roll_end) {
+  # setTxtProgressBar(pb, counter)
+  y_train = ytrunc[1:train_end_period]
+  x_train = exog[1:train_end_period, ]
+  
+  y_test = ytrunc[(train_end_period + 1):(train_end_period + n_ahead)]
+  x_test = exog[(train_end_period + 1):(train_end_period + n_ahead), ]
+
+  # fit model on training data
+  cur_model = Arima(y_train, 
+                    order=model_order, 
+                    xreg=x_train, 
+                    lambda=0, method="ML")
+  cur_pred = as.numeric(forecast(cur_model, xreg=x_test)$mean)
+  cur_rmse = sqrt(sum((y_test - cur_pred)^2))
+  cur_perc_err = 
+  
+  n_ahead_rmse[counter, ] = c(train_end_period, cur_rmse)
+  counter = counter + 1
+}
+# close(pb)
+
+# plot predicted RMSE over time
+p = ggplot() + 
+  geom_point(data=n_ahead_rmse, aes(x=period, y=rmse)) +
+  ylab('Forecasting RMSE') + xlab('Interval') +
+  ggtitle(sprintf("%d-steps ahead forecasting error", n_ahead))
+print(p)
+
+```
+
+The plot above indicates that our model does a decent job keeping prediction errors within a constrained band for the most part. However, there are clusters of intervals where the model performs poorly. 
+
+Given more time, one can look into what cause these RMSEs spikes, and if the model can be tweaked to do a better job.
